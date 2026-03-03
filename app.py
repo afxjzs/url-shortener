@@ -34,13 +34,22 @@ DATABASE_URL = os.getenv(
 engine = create_engine(DATABASE_URL, echo=False)
 Session = sessionmaker(bind=engine)
 
-# Create tables if they don't exist
-Base.metadata.create_all(engine)
+# Create tables if they don't exist (only if not testing)
+if not os.getenv('TESTING'):
+    try:
+        Base.metadata.create_all(engine)
+    except Exception as e:
+        logger.warning(f"Could not create tables on startup: {e}")
 
 # Flask app
 app = Flask(__name__)
 csrf = CSRFProtect(app)
-limiter = Limiter(key_func=get_remote_address, app=app, default_limits=['100 per hour'])
+
+# Disable rate limiting in test mode
+if os.getenv('TESTING'):
+    limiter = Limiter(key_func=get_remote_address, app=app, enabled=False)
+else:
+    limiter = Limiter(key_func=get_remote_address, app=app, default_limits=['100 per hour'])
 
 # Configure Flask
 app.config.update(
