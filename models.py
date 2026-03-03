@@ -1,7 +1,7 @@
 """Database models for URL Shortener service."""
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, Text, DateTime, Boolean, UUID, ForeignKey, Index, Integer
+from sqlalchemy import Column, String, Text, DateTime, Boolean, UUID, ForeignKey, Index, create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 
@@ -23,18 +23,35 @@ class Shortcode(Base):
     
     clicks = relationship('Click', back_populates='shortcode', cascade='all, delete-orphan')
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f'<Shortcode {self.shortcode}>'
+
+    def validate_shortcode(self) -> None:
+        """Validate shortcode is alphanumeric."""
+        if not self.shortcode.isalnum():
+            raise ValueError('Shortcode must be alphanumeric.')
+
+    def validate_url(self) -> None:
+        """Validate URL format."""
+        from urllib.parse import urlparse
+        result = urlparse(self.target_url)
+        if not all([result.scheme, result.netloc]):
+            raise ValueError('Invalid URL format.')
 
 
 class Click(Base):
     """Click tracking for shortcodes."""
     __tablename__ = 'url_shortener_clicks'
+    
+    __table_args__ = (
+        Index('ix_clicks_shortcode_id', 'shortcode_id'),
+        Index('ix_clicks_timestamp', 'timestamp'),
+    )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     shortcode_id = Column(UUID(as_uuid=True), ForeignKey('url_shortener_shortcodes.id'), nullable=False)
     timestamp = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
-    ip_address = Column(String(255), nullable=False)  # base64 encoded
+    ip_address = Column(String(255), nullable=False)
     user_agent = Column(Text, nullable=True)
     referer = Column(Text, nullable=True)
     country = Column(String(2), nullable=True)
@@ -42,7 +59,7 @@ class Click(Base):
     
     shortcode = relationship('Shortcode', back_populates='clicks')
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f'<Click {self.shortcode_id} @ {self.timestamp}>'
 
 

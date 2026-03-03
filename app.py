@@ -1,17 +1,30 @@
 """URL Shortener redirect service."""
 import os
-import base64
+import logging
+import functools
 import qrcode
 import io
 from datetime import datetime
 from flask import Flask, redirect, request, jsonify, send_file
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.exc import NoResultFound, IntegrityError
 from dotenv import load_dotenv
 from models import Base, Shortcode, Click
+from cryptography.fernet import Fernet
+from flask_wtf.csrf import CSRFProtect
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 # Load environment variables
 load_dotenv()
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Database setup
 DATABASE_URL = os.getenv(
@@ -26,24 +39,69 @@ Base.metadata.create_all(engine)
 
 # Flask app
 app = Flask(__name__)
-app.config['JSON_SORT_KEYS'] = False
+csrf = CSRFProtect(app)
+limiter = Limiter(key_func=get_remote_address, app=app, default_limits=['100 per hour'])
+
+# Configure Flask
+app.config.update(
+    JSON_SORT_KEYS=False,
+    SECRET_KEY=os.getenv('SECRET_KEY', 'dev-secret-key-change-in-production'),
+    WTF_CSRF_ENABLED=True
+)
+
+# Encryption setup
+ENCRYPTION_KEY = os.getenv('ENCRYPTION_KEY', 'u1Zk5M4Z3C1X2V5B7N9Q0W8E4R6T7Y9U1A2S3D5F=')
+try:
+    cipher_suite = Fernet(ENCRYPTION_KEY.encode() if isinstance(ENCRYPTION_KEY, str) else ENCRYPTION_KEY)
+except Exception as e:
+    logger.warning(f"Encryption key invalid, using unencrypted IP storage: {e}")
+    cipher_suite = None
 
 
-def get_ip_base64(ip_str):
-    """Encode IP address as base64."""
-    return base64.b64encode(ip_str.encode()).decode()
-
-
-def decode_ip_base64(encoded_ip):
-    """Decode base64 IP address."""
+def encrypt_ip(ip_str: str) -> str:
+    """Encrypt IP address using Fernet."""
+    if not cipher_suite:
+        return ip_str
     try:
-        return base64.b64decode(encoded_ip).decode()
-    except Exception:
-        return encoded_ip
+        return cipher_suite.encrypt(ip_str.encode()).decode()
+    except Exception as e:
+        logger.error(f"IP encryption failed: {e}")
+        return ip_str
+
+
+def decrypt_ip(encrypted_ip: str) -> str:
+    """Decrypt IP address."""
+    if not cipher_suite:
+        return encrypted_ip
+    try:
+        return cipher_suite.decrypt(encrypted_ip.encode()).decode()
+    except Exception as e:
+        logger.error(f"IP decryption failed: {e}")
+        return encrypted_ip
+
+
+@functools.lru_cache(maxsize=128)
+def generate_qr_code(shortcode: str) -> bytes:
+    """Generate QR code for shortcode (cached)."""
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=10,
+        border=4,
+    )
+    qr.add_data(f'http://l.afx.cc/{shortcode}')
+    qr.make(fit=True)
+
+    img = qr.make_image(fill_color='black', back_color='white')
+    img_io = io.BytesIO()
+    img.save(img_io, 'PNG')
+    img_io.seek(0)
+    return img_io.getvalue()
 
 
 @app.route('/<shortcode>', methods=['GET'])
-def redirect_shortcode(shortcode):
+@limiter.limit('100 per hour')
+def redirect_shortcode(shortcode: str):
     """Redirect to target URL and log the click."""
     session = Session()
     try:
@@ -54,6 +112,7 @@ def redirect_shortcode(shortcode):
         ).first()
 
         if not short:
+            logger.warning(f"Shortcode not found: {shortcode}")
             return jsonify({'error': 'Shortcode not found'}), 404
 
         # Log click
@@ -61,66 +120,65 @@ def redirect_shortcode(shortcode):
         referer = request.headers.get('Referer', '')
         ip_address = request.remote_addr or 'unknown'
         
-        # Get country/city from IP (optional - can enhance later)
-        country = None
-        city = None
-
         click = Click(
             shortcode_id=short.id,
             timestamp=datetime.utcnow(),
-            ip_address=get_ip_base64(ip_address),
+            ip_address=encrypt_ip(ip_address),
             user_agent=user_agent,
             referer=referer,
-            country=country,
-            city=city
+            country=None,
+            city=None
         )
-        session.add(click)
-        session.commit()
+        
+        try:
+            session.add(click)
+            session.commit()
+            logger.info(f"Click logged for {shortcode} from {ip_address}")
+        except IntegrityError as e:
+            session.rollback()
+            logger.error(f"Database integrity error: {e}")
+            return jsonify({'error': 'Failed to log click'}), 500
+        except Exception as e:
+            session.rollback()
+            logger.error(f"Database error: {e}")
+            return jsonify({'error': 'Internal server error'}), 500
 
         # Redirect
         return redirect(short.target_url, code=302)
 
+    except NoResultFound:
+        return jsonify({'error': 'Shortcode not found'}), 404
     except Exception as e:
-        print(f"Error: {e}")
+        logger.error(f"Redirect error: {e}")
         return jsonify({'error': 'Internal server error'}), 500
     finally:
         session.close()
 
 
 @app.route('/qr/<shortcode>', methods=['GET'])
-def get_qr_code(shortcode):
+def get_qr_code(shortcode: str):
     """Generate and return QR code for shortcode."""
     session = Session()
     try:
-        # Find shortcode
+        # Verify shortcode exists
         short = session.query(Shortcode).filter(
             Shortcode.shortcode == shortcode
         ).first()
 
         if not short:
+            logger.warning(f"QR code requested for non-existent shortcode: {shortcode}")
             return jsonify({'error': 'Shortcode not found'}), 404
 
-        # Generate QR code pointing to the redirect URL
-        qr = qrcode.QRCode(
-            version=1,
-            error_correction=qrcode.constants.ERROR_CORRECT_L,
-            box_size=10,
-            border=4,
-        )
-        qr.add_data(f'http://l.afx.cc/{shortcode}')
-        qr.make(fit=True)
+        # Generate QR code (cached)
+        qr_bytes = generate_qr_code(shortcode)
+        img_io = io.BytesIO(qr_bytes)
 
-        img = qr.make_image(fill_color='black', back_color='white')
-        
-        # Return as PNG
-        img_io = io.BytesIO()
-        img.save(img_io, 'PNG')
-        img_io.seek(0)
+        return send_file(img_io, mimetype='image/png', as_attachment=False)
 
-        return send_file(img_io, mimetype='image/png')
-
+    except NoResultFound:
+        return jsonify({'error': 'Shortcode not found'}), 404
     except Exception as e:
-        print(f"Error: {e}")
+        logger.error(f"QR code generation error: {e}")
         return jsonify({'error': 'Internal server error'}), 500
     finally:
         session.close()
@@ -133,8 +191,8 @@ def health():
 
 
 @app.route('/stats/<shortcode>', methods=['GET'])
-def get_stats(shortcode):
-    """Get click stats for a shortcode (basic)."""
+def get_stats(shortcode: str):
+    """Get click stats for a shortcode."""
     session = Session()
     try:
         short = session.query(Shortcode).filter(
@@ -155,13 +213,35 @@ def get_stats(shortcode):
             'active': short.active
         }), 200
 
+    except NoResultFound:
+        return jsonify({'error': 'Shortcode not found'}), 404
     except Exception as e:
-        print(f"Error: {e}")
+        logger.error(f"Stats error: {e}")
         return jsonify({'error': 'Internal server error'}), 500
     finally:
         session.close()
 
 
+@app.errorhandler(429)
+def rate_limit_handler(e):
+    """Handle rate limit exceeded."""
+    logger.warning(f"Rate limit exceeded: {request.remote_addr}")
+    return jsonify({'error': 'Rate limit exceeded'}), 429
+
+
+@app.errorhandler(404)
+def not_found(e):
+    """Handle 404."""
+    return jsonify({'error': 'Not found'}), 404
+
+
+@app.errorhandler(500)
+def server_error(e):
+    """Handle 500."""
+    logger.error(f"Server error: {e}")
+    return jsonify({'error': 'Internal server error'}), 500
+
+
 if __name__ == '__main__':
-    # Run development server
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    logger.info("Starting URL Shortener service...")
+    app.run(host='0.0.0.0', port=5000, debug=False)
